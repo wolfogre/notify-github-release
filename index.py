@@ -27,7 +27,7 @@ def check_github(access_token: str) -> []:
         logger.info("%s's latest release: %s %s %s",
                     repo.full_name,
                     latest_release.id, latest_release.title, latest_release.published_at.strftime('%Y-%m-%d %H:%M:%S'))
-        if (datetime.datetime.now() - latest_release.published_at).total_seconds() <= 7 * 24 * 60 * 60:
+        if (datetime.datetime.now() - latest_release.published_at).total_seconds() <= 24 * 60 * 60:
             result.append({
                 "full_name": repo.full_name,
                 "latest_release": latest_release,
