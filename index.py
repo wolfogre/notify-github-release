@@ -6,6 +6,8 @@ import smtplib
 from email.header import Header
 from email.mime.text import MIMEText
 
+import pytz
+
 import markdown
 
 from github import Github
@@ -15,6 +17,10 @@ from github.GitRelease import GitRelease
 
 def check_github(access_token: str) -> []:
     logger = logging.getLogger()
+
+    local_timezone = pytz.timezone("Asia/Shanghai")
+    now = local_timezone.localize(datetime.datetime.now())
+
     result = []
     g = Github(access_token)
     repos = g.get_user().get_starred()
@@ -24,22 +30,22 @@ def check_github(access_token: str) -> []:
         except UnknownObjectException:
             logging.info("%s has no release", repo.full_name)
             continue
+        published_at = pytz.utc.localize(latest_release.published_at).astimezone(local_timezone)
         logger.info("%s's latest release: %s %s %s",
                     repo.full_name,
-                    latest_release.id, latest_release.title, latest_release.published_at.strftime('%Y-%m-%d %H:%M:%S'))
-        if (datetime.datetime.now() - latest_release.published_at).total_seconds() <= 24 * 60 * 60:
+                    latest_release.id, latest_release.title, published_at.isoformat())
+        if (now - published_at).total_seconds() <= 24 * 60 * 60:
             result.append({
                 "full_name": repo.full_name,
                 "latest_release": latest_release,
             })
-        else:
-            logger.info("ignore %s because it is too old", latest_release.id)
 
     return result
 
 
 def send_email(email_context: dict, full_name: str, release: GitRelease):
     logger = logging.getLogger()
+    published_at = pytz.utc.localize(release.published_at).astimezone(pytz.timezone("Asia/Shanghai"))
     mail_msg = """
         <h2>%s</h1>
         <h3>%s / %s</h3>
@@ -48,7 +54,7 @@ def send_email(email_context: dict, full_name: str, release: GitRelease):
         <p>%s</p>
         """ % (full_name,
                release.tag_name, release.title,
-               release.published_at.strftime('%Y-%m-%d %H:%M:%S'), release.html_url, release.html_url,
+               published_at.isoformat(), release.html_url, release.html_url,
                markdown.markdown(release.body))
     message = MIMEText(mail_msg, 'html', 'utf-8')
 
@@ -71,6 +77,9 @@ def send_email(email_context: dict, full_name: str, release: GitRelease):
 def handler(event, context):
     logger = logging.getLogger()
     logger.info("start")
+
+    logger.info("event: %s", event)
+    logger.info("context: %s", context)
 
     result = check_github(os.environ["ACCESS_TOKEN"])
     logger.info("get %d new releases", len(result))
