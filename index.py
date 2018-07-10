@@ -56,12 +56,13 @@ def send_email(email_context: dict, full_name: str, release: GitRelease):
     message['To'] = Header(email_context["receiver"], 'utf-8')
     message['Subject'] = Header("GitHub New Release", 'utf-8')
 
+    logger.info("start send email of %s", release.id)
     try:
-        s = smtplib.SMTP()
-        s.connect(email_context["host"], 25)
-        s.login(email_context["user"], email_context["pass"])
-        s.sendmail(email_context["user"], [email_context["receiver"]], message.as_string())
-        logger.info("send email of %s", release.id)
+        client = smtplib.SMTP_SSL(timeout=10)
+        client.connect(email_context["host"], 465)
+        client.login(email_context["user"], email_context["pass"])
+        client.sendmail(email_context["user"], [email_context["receiver"]], message.as_string())
+        logger.info("finish send email of %s", release.id)
     except smtplib.SMTPException as e:
         logger.error("faild to send email of %s: %s", release.id, e)
         raise e
