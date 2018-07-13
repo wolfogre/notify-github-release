@@ -12,8 +12,9 @@ from github import Github, UnknownObjectException, Rate, GitRelease, Repository
 
 class Notifier:
     def __init__(self, access_token: str, email_context: dict, orgs: []):
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         self.__local_timezone = pytz.timezone("Asia/Shanghai")
-        self.__start_time = self.__local_timezone.localize(datetime.datetime.now())
+        self.__start_time = self.__local_timezone.fromutc(now)
 
         self.logger = logging.getLogger("Notifier")
         self.logger.info("start at %s", self.__start_time.isoformat())
@@ -45,21 +46,12 @@ class Notifier:
         result = {}
         repos = self.__github.get_user().get_starred()
         for repo in repos:
-            try:
-                release = repo.get_latest_release()
-            except UnknownObjectException:
-                self.logger.info("%s has no release", repo.full_name)
-                continue
-            published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
-            self.logger.info("%s's latest release: %s %s %s",
-                             repo.full_name,
-                             release.id, release.title, published_at.isoformat())
-            if (self.__start_time - published_at).total_seconds() <= 24 * 60 * 60:
+            release = self.__get_latest_release_within_one_day(repo)
+            if release is not None:
                 result["%d-%d" % (repo.id, release.id)] = {
                     "repo": repo,
                     "release": release,
                 }
-
         return result
 
     def __check_org(self, name: str) -> dict:
@@ -68,34 +60,48 @@ class Notifier:
         for repo in repos:
             if repo.fork:
                 repo = repo.source
-            try:
-                release = repo.get_latest_release()
-            except UnknownObjectException:
-                self.logger.info("%s has no release", repo.full_name)
-                continue
-            published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
-            self.logger.info("%s's latest release: %s %s %s",
-                             repo.full_name,
-                             release.id, release.title, published_at.isoformat())
-            if (self.__start_time - published_at).total_seconds() <= 24 * 60 * 60:
+            release = self.__get_latest_release_within_one_day(repo)
+            if release is not None:
                 result["%d-%d" % (repo.id, release.id)] = {
                     "repo": repo,
                     "release": release,
                 }
-
         return result
+
+    def __get_latest_release_within_one_day(self, repo: Repository) -> GitRelease:
+        # Draft releases and prereleases are not returned repo.get_latest_release().
+        release = None
+        for r in repo.get_releases():
+            if r.draft:
+                continue
+            release = r
+            break
+
+        if release is None:
+            self.logger.info("%s has no release", repo.full_name)
+            return None
+
+        published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
+        self.logger.info("%s's latest release: %s %s %s, %s ago",
+                         repo.full_name,
+                         release.id, release.title, published_at.isoformat(),
+                         (self.__start_time - published_at))
+        if (self.__start_time - published_at).total_seconds() <= 24 * 60 * 60:
+            return release
+
+        return None
 
     def __send_email(self, repo: Repository, release: GitRelease):
         published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
         mail_msg = """
-                <h2>%s</h1>
-                <h3>%s / %s</h3>
-                <p><strong>%s</strong>&nbsp;&nbsp;&nbsp;<a href="%s">%s</a></p>
+                <h2><a href="%s">%s</a></h1>
+                <h3><a href="%s">%s / %s</a></h3>
+                <p><strong>%s&nbsp;&nbsp;%s ago</strong></p>
                 <hr>
                 <p>%s</p>
-                """ % (repo.full_name,
-                       release.tag_name, release.title,
-                       published_at.isoformat(), release.html_url, release.html_url,
+                """ % (repo.html_url, repo.full_name,
+                       release.html_url, release.tag_name, release.title,
+                       published_at.isoformat(), (self.__start_time - published_at),
                        markdown.markdown(release.body))
         message = MIMEText(mail_msg, 'html', 'utf-8')
 
