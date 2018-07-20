@@ -1,6 +1,5 @@
 import os
 import shutil
-import zipfile
 from modulefinder import ModuleFinder
 
 
@@ -41,6 +40,7 @@ def main():
         shutil.rmtree(temp_dir)
 
     print("done")
+
 
 if __name__ == '__main__':
     main()
