@@ -1,7 +1,6 @@
 .idea/
 *.iml
-*.txt
-PKG-INFO
+*.zip
 
 # Created by https://www.gitignore.io/api/python
 

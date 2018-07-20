@@ -7,7 +7,7 @@ from email.mime.text import MIMEText
 
 import markdown
 import pytz
-from github import Github, UnknownObjectException, Rate, GitRelease, Repository
+from github import Github, GitRelease, Repository
 
 
 class Notifier:
