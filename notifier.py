@@ -61,13 +61,13 @@ class Notifier:
         for repo in repos:
             while True:
                 try:
-                    release = self.__get_latest_release_within_one_day(repo)
+                    release, check_tag = self.__get_latest_release_within_one_day(repo)
                     if release is not None:
                         result[repo.id] = {
                             "repo": repo,
                             "release": release,
                         }
-                    else:
+                    elif check_tag:
                         tag = self.__get_latest_tag_within_one_day(repo)
                         if tag is not None:
                             result[repo.id] = {
@@ -96,7 +96,7 @@ class Notifier:
             result[repo.id] = repo
         return result
 
-    def __get_latest_release_within_one_day(self, repo: Repository) -> GitRelease:
+    def __get_latest_release_within_one_day(self, repo: Repository) -> (GitRelease, bool):
         # Draft releases and prereleases are not returned repo.get_latest_release(), so use get_releases()
         self.logger.info("start get latest release of %s", repo.full_name)
         release = None
@@ -108,7 +108,7 @@ class Notifier:
 
         if release is None:
             self.logger.info("%s has no release", repo.full_name)
-            return None
+            return None, True
 
         published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
         self.logger.info("%s's latest release: %s %s %s, %s ago",
@@ -116,8 +116,8 @@ class Notifier:
                          release.id, release.title, published_at.isoformat(),
                          (self.__start_time - published_at))
         if (self.__start_time - published_at).total_seconds() <= 24 * 60 * 60:
-            return release
-        return None
+            return release, False
+        return None, False
 
     def __get_latest_tag_within_one_day(self, repo: Repository) -> dict:
         # visiting the html page is the only way to get the latest tag
