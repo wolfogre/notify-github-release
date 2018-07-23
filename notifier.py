@@ -59,6 +59,8 @@ class Notifier:
     def __check_repos(self, repos: []) -> dict:
         result = {}
         for repo in repos:
+            if repo.full_name != "go-redis/redis":
+                continue
             while True:
                 try:
                     release = self.__get_latest_release_within_one_day(repo)
@@ -197,7 +199,7 @@ class Notifier:
                 <h3><a href="%s">%s</a></h3>
                 <p><strong>%s&nbsp;&nbsp;%s ago</strong></p>
                 <hr>
-                <p><i>This is a regular Git tag that have not been associated with a release</i></p>
+                <p><i>This is a regular Git tag that has not been associated with a release</i></p>
                 """ % (repo.html_url, repo.full_name,
                        tag["html_url"], tag["name"],
                        published_at.isoformat(), (self.__start_time - published_at))
@@ -209,8 +211,7 @@ class Notifier:
 
         self.logger.info("start send email of %s", tag["id"])
         try:
-            client = smtplib.SMTP_SSL(timeout=10)
-            client.connect(self.__email_context["host"], 465)
+            client = smtplib.SMTP_SSL(host=self.__email_context["host"], timeout=10)
             client.login(self.__email_context["user"], self.__email_context["pass"])
             client.sendmail(self.__email_context["user"], [self.__email_context["receiver"]], message.as_string())
             client.close()
