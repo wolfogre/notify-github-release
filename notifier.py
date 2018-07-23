@@ -59,8 +59,6 @@ class Notifier:
     def __check_repos(self, repos: []) -> dict:
         result = {}
         for repo in repos:
-            if repo.full_name != "go-redis/redis":
-                continue
             while True:
                 try:
                     release = self.__get_latest_release_within_one_day(repo)
