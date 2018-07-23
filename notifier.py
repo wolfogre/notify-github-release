@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
+import _thread
 import datetime
 import gzip
 import logging
+import queue
 import re
 import smtplib
+import threading
+import uuid
 from _socket import timeout
 from email.header import Header
 from email.mime.text import MIMEText
@@ -16,7 +20,7 @@ from github import Github, GitRelease, Repository
 
 
 class Notifier:
-    def __init__(self, access_token: str, email_context: dict, orgs: []):
+    def __init__(self, task_id, access_token: str, email_context: dict, orgs: []):
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         self.__local_timezone = pytz.timezone("Asia/Shanghai")
         self.__start_time = self.__local_timezone.fromutc(now)
@@ -27,6 +31,10 @@ class Notifier:
         self.__github = Github(access_token)
         self.__email_context = email_context
         self.__orgs = orgs
+
+        self.__task_id = task_id
+
+        self.queue = queue.Queue()
 
     def run(self):
         self.__log_rate()
@@ -39,14 +47,18 @@ class Notifier:
             )
         self.logger.info("find total %d repos", len(repos))
 
-        result = self.__check_repos(repos.values())
-        self.logger.info("find %d repos have update", len(result))
-        for i in result:
-            v = result[i]
-            if "release" in v:
-                self.__send_email_with_release(v["repo"], v["release"])
-            if "tag" in v:
-                self.__send_email_with_tag(v["repo"], v["tag"])
+        for repo in repos.values():
+            self.queue.put(repo)
+        slavers = []
+        for i in range(64):
+            slavers.append(Slaver(self))
+        for slave in slavers:
+            slave.start()
+        for slave in slavers:
+            slave.join()
+            if not slave.if_done():
+                raise RuntimeError("thead exit with exception")
+
         self.__log_rate()
 
     def __log_rate(self):
@@ -56,29 +68,27 @@ class Notifier:
                          pytz.utc.localize(
                              self.__github.get_rate_limit().rate.reset).astimezone(self.__local_timezone))
 
-    def __check_repos(self, repos: []) -> dict:
-        result = {}
-        for repo in repos:
-            while True:
-                try:
-                    release = self.__get_latest_release_within_one_day(repo)
-                    if release is not None:
-                        result[repo.id] = {
+    def check_repo(self, repo: Repository) -> dict:
+        while True:
+            try:
+                release = self.__get_latest_release_within_one_day(repo)
+                if release is not None:
+                    return {
+                        "repo": repo,
+                        "release": release,
+                    }
+                else:
+                    tag = self.__get_latest_tag_within_one_day(repo)
+                    if tag is not None:
+                        return {
                             "repo": repo,
-                            "release": release,
+                            "tag": tag,
                         }
-                    else:
-                        tag = self.__get_latest_tag_within_one_day(repo)
-                        if tag is not None:
-                            result[repo.id] = {
-                                "repo": repo,
-                                "tag": tag,
-                            }
-                except (HTTPError, URLError, timeout) as e:
-                    self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
-                    continue
-                break
-        return result
+            except (HTTPError, URLError, timeout) as e:
+                self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
+                continue
+            break
+        return {}
 
     def __get_starred_repos(self) -> dict:
         result = {}
@@ -160,7 +170,7 @@ class Notifier:
             }
         return None
 
-    def __send_email_with_release(self, repo: Repository, release: GitRelease):
+    def send_email_with_release(self, repo: Repository, release: GitRelease):
         published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
         mail_msg = """
                 <h2><a href="%s">%s</a></h1>
@@ -168,29 +178,22 @@ class Notifier:
                 <p><strong>%s&nbsp;&nbsp;%s ago</strong></p>
                 <hr>
                 <p>%s</p>
+                <br/>
+                <br/>
+                <p><i>%s</i></p>
                 """ % (repo.html_url, repo.full_name,
                        release.html_url, release.tag_name, release.title,
                        published_at.isoformat(), (self.__start_time - published_at),
-                       markdown.markdown(release.body))
+                       markdown.markdown(release.body),
+                       self.__task_id)
         message = MIMEText(mail_msg, 'html', 'utf-8')
 
         message['From'] = Header(self.__email_context["user"], 'utf-8')
         message['To'] = Header(self.__email_context["receiver"], 'utf-8')
         message['Subject'] = Header(repo.full_name, 'utf-8')
+        self.__send_email(release.id, message)
 
-        self.logger.info("start send email of %s", release.id)
-        try:
-            client = smtplib.SMTP_SSL(timeout=10)
-            client.connect(self.__email_context["host"], 465)
-            client.login(self.__email_context["user"], self.__email_context["pass"])
-            client.sendmail(self.__email_context["user"], [self.__email_context["receiver"]], message.as_string())
-            client.close()
-            self.logger.info("finish send email of %s", release.id)
-        except smtplib.SMTPException as e:
-            self.logger.error("faild to send email of %s: %s", release.id, e)
-            raise e
-
-    def __send_email_with_tag(self, repo: Repository, tag: dict):
+    def send_email_with_tag(self, repo: Repository, tag: dict):
         published_at = tag["published_at"]
         mail_msg = """
                 <h2><a href="%s">%s</a></h1>
@@ -198,23 +201,54 @@ class Notifier:
                 <p><strong>%s&nbsp;&nbsp;%s ago</strong></p>
                 <hr>
                 <p><i>This is a regular Git tag that has not been associated with a release</i></p>
+                <br/>
+                <br/>
+                <p><i>%s</i></p>
                 """ % (repo.html_url, repo.full_name,
                        tag["html_url"], tag["name"],
-                       published_at.isoformat(), (self.__start_time - published_at))
+                       published_at.isoformat(), (self.__start_time - published_at),
+                       self.__task_id)
         message = MIMEText(mail_msg, 'html', 'utf-8')
 
         message['From'] = Header(self.__email_context["user"], 'utf-8')
         message['To'] = Header(self.__email_context["receiver"], 'utf-8')
         message['Subject'] = Header(repo.full_name, 'utf-8')
+        self.__send_email(tag["id"], message)
 
-        self.logger.info("start send email of %s", tag["id"])
+    def __send_email(self, _id: str, message: MIMEText):
+        self.logger.info("start send email of %s", _id)
         try:
             client = smtplib.SMTP_SSL(host=self.__email_context["host"], timeout=10)
             client.login(self.__email_context["user"], self.__email_context["pass"])
             client.sendmail(self.__email_context["user"], [self.__email_context["receiver"]], message.as_string())
             client.close()
-            self.logger.info("finish send email of %s", tag["id"])
+            self.logger.info("finish send email of %s", _id)
         except smtplib.SMTPException as e:
-            self.logger.error("faild to send email of %s: %s", tag["id"], e)
+            self.logger.error("faild to send email of %s: %s", _id, e)
             raise e
 
+
+class Slaver (threading.Thread):
+    def __init__(self, master: Notifier):
+        threading.Thread.__init__(self)
+        self.__master = master
+        self.__done = False
+
+    def run(self):
+        self.__master.logger.info("slaver with thread %s started", _thread.get_ident())
+        while True:
+            try:
+                repo = self.__master.queue.get_nowait()
+            except queue.Empty:
+                break
+            result = self.__master.check_repo(repo)
+            if "release" in result:
+                self.__master.send_email_with_release(result["repo"], result["release"])
+            if "tag" in result:
+                self.__master.send_email_with_tag(result["repo"], result["tag"])
+
+        self.__done = True
+        self.__master.logger.info("slaver with thread %s exited", _thread.get_ident())
+
+    def if_done(self):
+        return self.__done
