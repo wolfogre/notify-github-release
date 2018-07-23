@@ -50,14 +50,14 @@ class Notifier:
         for repo in repos.values():
             self.queue.put(repo)
         slavers = []
-        for i in range(64):
+        for i in range(16):
             slavers.append(Slaver(self))
         for slave in slavers:
             slave.start()
         for slave in slavers:
             slave.join()
-            if not slave.if_done():
-                raise RuntimeError("thead exit with exception")
+            if slave.exception() is not None:
+                raise RuntimeError("thead exit with exception: %s", slave.exception())
 
         self.__log_rate()
 
@@ -69,25 +69,19 @@ class Notifier:
                              self.__github.get_rate_limit().rate.reset).astimezone(self.__local_timezone))
 
     def check_repo(self, repo: Repository) -> dict:
-        while True:
-            try:
-                release = self.__get_latest_release_within_one_day(repo)
-                if release is not None:
-                    return {
-                        "repo": repo,
-                        "release": release,
-                    }
-                else:
-                    tag = self.__get_latest_tag_within_one_day(repo)
-                    if tag is not None:
-                        return {
-                            "repo": repo,
-                            "tag": tag,
-                        }
-            except (HTTPError, URLError, timeout) as e:
-                self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
-                continue
-            break
+        release = self.__get_latest_release_within_one_day(repo)
+        if release is not None:
+            return {
+                "repo": repo,
+                "release": release,
+            }
+        else:
+            tag = self.__get_latest_tag_within_one_day(repo)
+            if tag is not None:
+                return {
+                    "repo": repo,
+                    "tag": tag,
+                }
         return {}
 
     def __get_starred_repos(self) -> dict:
@@ -132,7 +126,14 @@ class Notifier:
     def __get_latest_tag_within_one_day(self, repo: Repository) -> dict:
         # visiting the html page is the only way to get the latest tag
         self.logger.info("start get latest tag of %s", repo.full_name)
-        resp = request.urlopen(repo.html_url + "/tags", timeout=5)
+        while True:
+            try:
+                resp = request.urlopen(repo.html_url + "/tags", timeout=5)
+            except (HTTPError, URLError, timeout) as e:
+                self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
+                continue
+            break
+
         buffer = resp.read()
         if resp.info().get('Content-Encoding') == 'gzip':
             buffer = gzip.decompress(buffer)
@@ -232,9 +233,16 @@ class Slaver (threading.Thread):
     def __init__(self, master: Notifier):
         threading.Thread.__init__(self)
         self.__master = master
-        self.__done = False
+        self.__exception = None
 
     def run(self):
+        try:
+            self.__run()
+        except Exception as e:
+            self.__exception = e
+            return
+
+    def __run(self):
         self.__master.logger.info("slaver with thread %s started", _thread.get_ident())
         while True:
             try:
@@ -250,5 +258,5 @@ class Slaver (threading.Thread):
         self.__done = True
         self.__master.logger.info("slaver with thread %s exited", _thread.get_ident())
 
-    def if_done(self):
-        return self.__done
+    def exception(self) -> Exception:
+        return self.__exception
