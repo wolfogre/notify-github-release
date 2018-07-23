@@ -124,6 +124,8 @@ class Notifier:
         self.logger.info("start get latest tag of %s", repo.full_name)
         resp = request.urlopen(repo.html_url + "/tags", timeout=5)
         buffer = resp.read()
+        if resp.info().get('Content-Encoding') == 'gzip':
+            buffer = gzip.decompress(buffer)
         body = str(buffer, encoding="utf-8")
 
         pattern = re.compile('<span class="tag-name">.*?</span>')
