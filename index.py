@@ -13,7 +13,7 @@ def handler(event, context):
     logger.info("event: %s", event)
     logger.info("context: %s", context)
 
-    task_id = context.request_id
+    task_id = "%s/%s" % (context.request_id, uuid.uuid1())
     access_token = os.environ["ACCESS_TOKEN"]
     email_context = {
         "host": os.environ["EMAIL_HOST"],

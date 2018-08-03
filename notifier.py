@@ -7,7 +7,7 @@ import queue
 import re
 import smtplib
 import threading
-import uuid
+import time
 from _socket import timeout
 from email.header import Header
 from email.mime.text import MIMEText
@@ -218,15 +218,18 @@ class Notifier:
 
     def __send_email(self, _id: str, message: MIMEText):
         self.logger.info("start send email of %s", _id)
-        try:
-            client = smtplib.SMTP_SSL(host=self.__email_context["host"], timeout=10)
-            client.login(self.__email_context["user"], self.__email_context["pass"])
-            client.sendmail(self.__email_context["user"], [self.__email_context["receiver"]], message.as_string())
-            client.close()
-            self.logger.info("finish send email of %s", _id)
-        except smtplib.SMTPException as e:
-            self.logger.error("faild to send email of %s: %s", _id, e)
-            raise e
+        while True:
+            try:
+                client = smtplib.SMTP_SSL(host=self.__email_context["host"], timeout=10)
+                client.login(self.__email_context["user"], self.__email_context["pass"])
+                client.sendmail(self.__email_context["user"], [self.__email_context["receiver"]], message.as_string())
+                client.close()
+                self.logger.info("finish send email of %s", _id)
+            except smtplib.SMTPException as e:
+                self.logger.error("faild to send email of %s: %s", _id, e)
+                time.sleep(1)
+                continue
+            break
 
 
 class Slaver (threading.Thread):
