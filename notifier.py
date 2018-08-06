@@ -124,51 +124,41 @@ class Notifier:
         return None
 
     def __get_latest_tag_within_one_day(self, repo: Repository) -> dict:
-        # visiting the html page is the only way to get the latest tag
+        # scan all tags to find the latest tag
         self.logger.info("start get latest tag of %s", repo.full_name)
-        while True:
-            try:
-                resp = request.urlopen(repo.html_url + "/tags", timeout=5)
-            except (HTTPError, URLError, timeout) as e:
-                self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
-                continue
-            break
 
-        buffer = resp.read()
-        if resp.info().get('Content-Encoding') == 'gzip':
-            buffer = gzip.decompress(buffer)
-        body = str(buffer, encoding="utf-8")
+        tags = repo.get_tags()
+        latest_tag = None
+        for t in tags:
+            git_object = repo.get_git_ref("tags/" + t.name).object
+            date = None
+            if git_object.type == "commit":
+                date = repo.get_git_commit(git_object.sha).committer.date
+            if git_object.type == "tag":
+                date = repo.get_git_tag(git_object.sha).tagger.date
+            if date is None:
+                raise RuntimeError("wrong git object type: %s, %s" % (git_object.type, git_object.url))
+            published_at = pytz.utc.localize(date).astimezone(self.__local_timezone)
 
-        pattern = re.compile('<span class="tag-name">.*?</span>')
-        tag_names = pattern.findall(body)
-        if len(tag_names) == 0:
+            if latest_tag is None or latest_tag["published_at"] < published_at:
+                latest_tag = {
+                    "name": t.name,
+                    "html_url": "%s/releases/tag/%s" % (repo.html_url, t.name),
+                    "published_at": published_at,
+                    "id": git_object.sha,
+                }
+
+        if latest_tag is None:
             self.logger.info("%s has no tag", repo.full_name)
             return None
 
-        latest_tag_name = tag_names[0].replace('<span class="tag-name">', '').replace('</span>', '')
-
-        git_object = repo.get_git_ref("tags/" + latest_tag_name).object
-        date = None
-        if git_object.type == "commit":
-            date = repo.get_git_commit(git_object.sha).committer.date
-        if git_object.type == "tag":
-            date = repo.get_git_tag(git_object.sha).tagger.date
-        if date is None:
-            raise RuntimeError("wrong git object type: %s, %s" % (git_object.type, git_object.url))
-
-        published_at = pytz.utc.localize(date).astimezone(self.__local_timezone)
         self.logger.info("%s's latest tag: %s %s %s, %s ago",
                          repo.full_name,
-                         git_object.sha, latest_tag_name, published_at.isoformat(),
-                         (self.__start_time - published_at))
+                         latest_tag["id"], latest_tag["name"], latest_tag["published_at"].isoformat(),
+                         (self.__start_time - latest_tag["published_at"]))
 
-        if (self.__start_time - published_at).total_seconds() <= 24 * 60 * 60:
-            return {
-                "name": latest_tag_name,
-                "html_url": "%s/releases/tag/%s" % (repo.html_url, latest_tag_name),
-                "published_at": published_at,
-                "id": git_object.sha,
-            }
+        if (self.__start_time - latest_tag["published_at"]).total_seconds() <= 24 * 60 * 60:
+            return latest_tag
         return None
 
     def send_email_with_release(self, repo: Repository, release: GitRelease):
