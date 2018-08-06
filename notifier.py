@@ -1,23 +1,24 @@
 # -*- coding: utf-8 -*-
 import _thread
 import datetime
+import gzip
 import logging
 import queue
+import re
 import smtplib
 import threading
 import time
 from email.header import Header
 from email.mime.text import MIMEText
-from os import path
+from urllib import request
 
-import git
 import markdown
 import pytz
 from github import Github, GitRelease, Repository
 
 
 class Notifier:
-    def __init__(self, task_id, access_token: str, email_context: dict, orgs: [], tmp_dir: str):
+    def __init__(self, task_id, access_token: str, email_context: dict, orgs: []):
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         self.__local_timezone = pytz.timezone("Asia/Shanghai")
         self.__start_time = self.__local_timezone.fromutc(now)
@@ -32,8 +33,6 @@ class Notifier:
         self.__task_id = task_id
 
         self.queue = queue.Queue()
-
-        self.__tmp_dir = tmp_dir
 
     def run(self):
         self.__log_rate()
@@ -124,7 +123,7 @@ class Notifier:
 
     def __get_latest_tag_within_one_day(self, repo: Repository) -> dict:
         # scan all tags to find the latest tag
-        # if tags is to much, clone the repo to local host to find the latest tag
+        # if tags is to much, crawl the tag page to find the latest tag
         self.logger.info("start get latest tag of %s", repo.full_name)
 
         tags = repo.get_tags()
@@ -136,7 +135,7 @@ class Notifier:
         latest_tag = None
 
         if len(tag_list) > 100:
-            latest_tag = self.__get_latest_tag_by_local_git(repo)
+            latest_tag = self.__get_latest_tag_by_crawling(repo)
         else:
             for t in tag_list:
                 git_object = repo.get_git_ref("tags/" + t.name).object
@@ -172,22 +171,46 @@ class Notifier:
             return latest_tag
         return None
 
-    def __get_latest_tag_by_local_git(self, repo: Repository) -> dict:
-        self.logger.info("start clone %s to local", repo.full_name)
-        local_repo = git.Repo.clone_from(repo.clone_url, path.join(self.__tmp_dir, repo.full_name))
-        self.logger.info("finish clone %s to local", repo.full_name)
+    def __get_latest_tag_by_crawling(self, repo: Repository) -> dict:
+        # visiting the tag page to find the latest tag
+        self.logger.info("start crawl tags of %s", repo.full_name)
+        while True:
+            try:
+                resp = request.urlopen(repo.html_url + "/tags", timeout=5)
+            except Exception as e:
+                self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
+                continue
+            break
+        self.logger.info("finish crawl tags of %s", repo.full_name)
 
-        latest_tag = None
-        for t in local_repo.tags:
-            date = t.commit.committed_datetime
-            published_at = pytz.utc.localize(date).astimezone(self.__local_timezone)
-            if latest_tag is None or latest_tag["published_at"] < published_at:
-                latest_tag = {
-                    "name": t.name,
-                    "html_url": "%s/releases/tag/%s" % (repo.html_url, t.name),
-                    "published_at": published_at,
-                    "id": t.commit.hexsha,
-                }
+        buffer = resp.read()
+        if resp.info().get('Content-Encoding') == 'gzip':
+            buffer = gzip.decompress(buffer)
+        body = str(buffer, encoding="utf-8")
+
+        pattern = re.compile('<span class="tag-name">.*?</span>')
+        tag_names = pattern.findall(body)
+        if len(tag_names) == 0:
+            return None
+
+        latest_tag_name = tag_names[0].replace('<span class="tag-name">', '').replace('</span>', '')
+
+        git_object = repo.get_git_ref("tags/" + latest_tag_name).object
+        date = None
+        if git_object.type == "commit":
+            date = repo.get_git_commit(git_object.sha).committer.date
+        if git_object.type == "tag":
+            date = repo.get_git_tag(git_object.sha).tagger.date
+        if date is None:
+            raise RuntimeError("wrong git object type: %s, %s" % (git_object.type, git_object.url))
+
+        published_at = pytz.utc.localize(date).astimezone(self.__local_timezone)
+        return {
+            "name": latest_tag_name,
+            "html_url": "%s/releases/tag/%s" % (repo.html_url, latest_tag_name),
+            "published_at": published_at,
+            "id": git_object.sha,
+        }
 
     def send_email_with_release(self, repo: Repository, release: GitRelease):
         published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)

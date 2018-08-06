@@ -23,11 +23,7 @@ def handler(event, context):
     }
     orgs = [os.environ["ORG"]]
 
-    tmp_dir = "/tmp"
-    if b"tmp_dir" in event:
-        tmp_dir = event["tmp_dir"]
-
-    notifier.Notifier(task_id, access_token, email_context, orgs, tmp_dir).run()
+    notifier.Notifier(task_id, access_token, email_context, orgs).run()
 
     logger.info("exit")
 
@@ -41,7 +37,7 @@ class FCContext(dict):
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    handler({b"tmp_dir": "./tmp"}, FCContext({"request_id": "debug-%s" % uuid.uuid1()}))
+    handler(None, FCContext({"request_id": "debug-%s" % uuid.uuid1()}))
 
 
 
