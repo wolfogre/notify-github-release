@@ -20,7 +20,7 @@ local_timezone = tz.gettz("Asia/Shanghai")
 
 class Notifier:
     def __init__(self, task_id, access_token: str, email_context: dict, orgs: []):
-        self.__start_time = datetime.datetime.now(local_timezone)
+        self.__start_time = datetime.datetime.now(tz.tzlocal()).astimezone(local_timezone)
 
         self.logger = logging.getLogger("Notifier")
         self.logger.info("start at %s", self.__start_time.isoformat())
@@ -68,7 +68,7 @@ class Notifier:
         self.logger.info("rate: limit %d, remain %d, reset %s",
                          rage.limit,
                          rage.remaining,
-                         rage.reset.isoformat())
+                         rage.reset.replace(tzinfo=tz.tzutc()).astimezone(local_timezone))
 
     def __get_starred_repos(self) -> dict:
         result = {}
@@ -172,7 +172,7 @@ class Slaver (threading.Thread):
                 "repo_name": repo.full_name,
                 "repo_url": repo.html_url,
                 "release_name": elem.find("{http://www.w3.org/2005/Atom}id").text.split("/")[-1],
-                "release_time": parser().parse(elem.find("{http://www.w3.org/2005/Atom}updated").text).replace(tzinfo=local_timezone),
+                "release_time": parser().parse(elem.find("{http://www.w3.org/2005/Atom}updated").text).astimezone(local_timezone),
                 "release_url": elem.find("{http://www.w3.org/2005/Atom}link").attrib["href"],
                 "release_title": elem.find("{http://www.w3.org/2005/Atom}title").text,
                 "release_content": elem.find("{http://www.w3.org/2005/Atom}content").text,
