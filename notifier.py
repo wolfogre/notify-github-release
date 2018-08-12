@@ -68,7 +68,7 @@ class Notifier:
         self.logger.info("rate: limit %d, remain %d, reset %s",
                          rage.limit,
                          rage.remaining,
-                         rage.resetisoformat())
+                         rage.reset.isoformat())
 
     def __get_starred_repos(self) -> dict:
         result = {}
