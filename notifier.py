@@ -1,27 +1,26 @@
 # -*- coding: utf-8 -*-
 import _thread
 import datetime
-import gzip
 import logging
 import queue
-import re
 import smtplib
 import threading
 import time
 from email.header import Header
 from email.mime.text import MIMEText
 from urllib import request
+from xml.etree.ElementTree import ElementTree
 
-import markdown
-import pytz
-from github import Github, GitRelease, Repository
+from dateutil import tz
+from dateutil.parser import parser
+from github import Github, Repository
+
+local_timezone = tz.gettz("Asia/Shanghai")
 
 
 class Notifier:
     def __init__(self, task_id, access_token: str, email_context: dict, orgs: []):
-        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        self.__local_timezone = pytz.timezone("Asia/Shanghai")
-        self.__start_time = self.__local_timezone.fromutc(now)
+        self.__start_time = datetime.datetime.now(local_timezone)
 
         self.logger = logging.getLogger("Notifier")
         self.logger.info("start at %s", self.__start_time.isoformat())
@@ -31,8 +30,6 @@ class Notifier:
         self.__orgs = orgs
 
         self.__task_id = task_id
-
-        self.queue = queue.Queue()
 
     def run(self):
         self.__log_rate()
@@ -45,11 +42,14 @@ class Notifier:
             )
         self.logger.info("find total %d repos", len(repos))
 
+        task = queue.Queue()
         for repo in repos.values():
-            self.queue.put(repo)
+            task.put(repo)
+
         slavers = []
-        for i in range(16):
-            slavers.append(Slaver(self))
+        result = {}
+        for i in range(32):
+            slavers.append(Slaver(task, result))
         for slave in slavers:
             slave.start()
         for slave in slavers:
@@ -57,30 +57,18 @@ class Notifier:
             if slave.exception() is not None:
                 raise RuntimeError("thead exit with exception: %s", slave.exception())
 
+        for release in result.values():
+            if release is not None and (self.__start_time - release["release_time"]).total_seconds() <= 24 * 60 * 60:
+                self.__send_email(release)
+
         self.__log_rate()
 
     def __log_rate(self):
+        rage = self.__github.get_rate_limit().rate
         self.logger.info("rate: limit %d, remain %d, reset %s",
-                         self.__github.get_rate_limit().rate.limit,
-                         self.__github.get_rate_limit().rate.remaining,
-                         pytz.utc.localize(
-                             self.__github.get_rate_limit().rate.reset).astimezone(self.__local_timezone))
-
-    def check_repo(self, repo: Repository) -> dict:
-        release = self.__get_latest_release_within_one_day(repo)
-        if release is not None:
-            return {
-                "repo": repo,
-                "release": release,
-            }
-        else:
-            tag = self.__get_latest_tag_within_one_day(repo)
-            if tag is not None:
-                return {
-                    "repo": repo,
-                    "tag": tag,
-                }
-        return {}
+                         rage.limit,
+                         rage.remaining,
+                         rage.resetisoformat())
 
     def __get_starred_repos(self) -> dict:
         result = {}
@@ -98,122 +86,7 @@ class Notifier:
             result[repo.id] = repo
         return result
 
-    def __get_latest_release_within_one_day(self, repo: Repository) -> GitRelease:
-        # Draft releases and prereleases are not returned repo.get_latest_release(), so use get_releases()
-        self.logger.info("start get latest release of %s", repo.full_name)
-        release = None
-        for r in repo.get_releases():
-            if r.draft:
-                continue
-            release = r
-            break
-
-        if release is None:
-            self.logger.info("%s has no release", repo.full_name)
-            return None
-
-        published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
-        self.logger.info("%s's latest release: %s %s %s, %s ago",
-                         repo.full_name,
-                         release.id, release.title, published_at.isoformat(),
-                         (self.__start_time - published_at))
-        if (self.__start_time - published_at).total_seconds() <= 24 * 60 * 60:
-            return release
-        return None
-
-    def __get_latest_tag_within_one_day(self, repo: Repository) -> dict:
-        # scan all tags to find the latest tag
-        # if tags is to much, crawl the tag page to find the latest tag
-        self.logger.info("start get latest tag of %s", repo.full_name)
-
-        tags = repo.get_tags()
-        tag_list = []
-
-        for t in tags:
-            tag_list.append(t)
-
-        latest_tag = None
-
-        if len(tag_list) > 100:
-            latest_tag = self.__get_latest_tag_by_crawling(repo)
-        else:
-            for t in tag_list:
-                git_object = repo.get_git_ref("tags/" + t.name).object
-                date = None
-                if git_object.type == "commit":
-                    date = repo.get_git_commit(git_object.sha).committer.date
-                if git_object.type == "tag":
-                    date = repo.get_git_tag(git_object.sha).tagger.date
-                if date is None:
-                    raise RuntimeError("wrong git object type: %s, %s" % (git_object.type, git_object.url))
-                published_at = pytz.utc.localize(date).astimezone(self.__local_timezone)
-
-                if latest_tag is None or latest_tag["published_at"] < published_at:
-                    latest_tag = {
-                        "name": t.name,
-                        "html_url": "%s/releases/tag/%s" % (repo.html_url, t.name),
-                        "published_at": published_at,
-                        "id": git_object.sha,
-                    }
-
-        self.logger.info("%s has %s tags", repo.full_name, len(tag_list))
-
-        if latest_tag is None:
-            self.logger.info("%s has no tag", repo.full_name)
-            return None
-
-        self.logger.info("%s's latest tag: %s %s %s, %s ago",
-                         repo.full_name,
-                         latest_tag["id"], latest_tag["name"], latest_tag["published_at"].isoformat(),
-                         (self.__start_time - latest_tag["published_at"]))
-
-        if (self.__start_time - latest_tag["published_at"]).total_seconds() <= 24 * 60 * 60:
-            return latest_tag
-        return None
-
-    def __get_latest_tag_by_crawling(self, repo: Repository) -> dict:
-        # visiting the tag page to find the latest tag
-        self.logger.info("start crawl tags of %s", repo.full_name)
-        while True:
-            try:
-                resp = request.urlopen(repo.html_url + "/tags", timeout=5)
-            except Exception as e:
-                self.logger.error("visit tag page %s failed: %s", repo.html_url + "/tags", e)
-                continue
-            break
-        self.logger.info("finish crawl tags of %s", repo.full_name)
-
-        buffer = resp.read()
-        if resp.info().get('Content-Encoding') == 'gzip':
-            buffer = gzip.decompress(buffer)
-        body = str(buffer, encoding="utf-8")
-
-        pattern = re.compile('<span class="tag-name">.*?</span>')
-        tag_names = pattern.findall(body)
-        if len(tag_names) == 0:
-            return None
-
-        latest_tag_name = tag_names[0].replace('<span class="tag-name">', '').replace('</span>', '')
-
-        git_object = repo.get_git_ref("tags/" + latest_tag_name).object
-        date = None
-        if git_object.type == "commit":
-            date = repo.get_git_commit(git_object.sha).committer.date
-        if git_object.type == "tag":
-            date = repo.get_git_tag(git_object.sha).tagger.date
-        if date is None:
-            raise RuntimeError("wrong git object type: %s, %s" % (git_object.type, git_object.url))
-
-        published_at = pytz.utc.localize(date).astimezone(self.__local_timezone)
-        return {
-            "name": latest_tag_name,
-            "html_url": "%s/releases/tag/%s" % (repo.html_url, latest_tag_name),
-            "published_at": published_at,
-            "id": git_object.sha,
-        }
-
-    def send_email_with_release(self, repo: Repository, release: GitRelease):
-        published_at = pytz.utc.localize(release.published_at).astimezone(self.__local_timezone)
+    def __send_email(self, release: dict):
         mail_msg = """
                 <h2><a href="%s">%s</a></h1>
                 <h3><a href="%s">%s / %s</a></h3>
@@ -223,61 +96,41 @@ class Notifier:
                 <br/>
                 <br/>
                 <p><i>%s</i></p>
-                """ % (repo.html_url, repo.full_name,
-                       release.html_url, release.tag_name, release.title,
-                       published_at.isoformat(), (self.__start_time - published_at),
-                       markdown.markdown(release.body),
+                """ % (release["repo_url"], release["repo_name"],
+                       release["release_url"], release["release_name"], release["release_title"],
+                       release["release_time"].isoformat(),
+                       (self.__start_time - release["release_time"]),
+                       release["release_content"],
                        self.__task_id)
         message = MIMEText(mail_msg, 'html', 'utf-8')
 
         message['From'] = Header(self.__email_context["user"], 'utf-8')
         message['To'] = Header(self.__email_context["receiver"], 'utf-8')
-        message['Subject'] = Header(repo.full_name, 'utf-8')
-        self.__send_email(release.id, message)
+        message['Subject'] = Header(release["repo_name"], 'utf-8')
 
-    def send_email_with_tag(self, repo: Repository, tag: dict):
-        published_at = tag["published_at"]
-        mail_msg = """
-                <h2><a href="%s">%s</a></h1>
-                <h3><a href="%s">%s</a></h3>
-                <p><strong>%s&nbsp;&nbsp;%s ago</strong></p>
-                <hr>
-                <p><i>This is a regular Git tag that has not been associated with a release</i></p>
-                <br/>
-                <br/>
-                <p><i>%s</i></p>
-                """ % (repo.html_url, repo.full_name,
-                       tag["html_url"], tag["name"],
-                       published_at.isoformat(), (self.__start_time - published_at),
-                       self.__task_id)
-        message = MIMEText(mail_msg, 'html', 'utf-8')
-
-        message['From'] = Header(self.__email_context["user"], 'utf-8')
-        message['To'] = Header(self.__email_context["receiver"], 'utf-8')
-        message['Subject'] = Header(repo.full_name, 'utf-8')
-        self.__send_email(tag["id"], message)
-
-    def __send_email(self, _id: str, message: MIMEText):
-        self.logger.info("start send email of %s", _id)
+        self.logger.info("start send email of %s %s", release["repo_name"], release["release_name"])
         while True:
             try:
                 client = smtplib.SMTP_SSL(host=self.__email_context["host"], timeout=10)
                 client.login(self.__email_context["user"], self.__email_context["pass"])
                 client.sendmail(self.__email_context["user"], [self.__email_context["receiver"]], message.as_string())
                 client.close()
-                self.logger.info("finish send email of %s", _id)
+                self.logger.info("finish send email of %s %s", release["repo_name"], release["release_name"])
             except smtplib.SMTPException as e:
-                self.logger.error("faild to send email of %s: %s", _id, e)
+                self.logger.info("fail to send email of %s %s: %s", release["repo_name"], release["release_name"], e)
                 time.sleep(1)
                 continue
             break
 
 
 class Slaver (threading.Thread):
-    def __init__(self, master: Notifier):
+    def __init__(self, task: queue.Queue, result: dict):
         threading.Thread.__init__(self)
-        self.__master = master
+        self.__task = task
+        self.__result = result
         self.__exception = None
+        self.__opener = request.build_opener()
+        self.logger = logging.getLogger("Slaver")
 
     def run(self):
         try:
@@ -287,20 +140,55 @@ class Slaver (threading.Thread):
             return
 
     def __run(self):
-        self.__master.logger.info("slaver with thread %s started", _thread.get_ident())
+        self.logger.info("slaver with thread %s started", _thread.get_ident())
         while True:
             try:
-                repo = self.__master.queue.get_nowait()
+                repo = self.__task.get_nowait()
             except queue.Empty:
                 break
-            result = self.__master.check_repo(repo)
-            if "release" in result:
-                self.__master.send_email_with_release(result["repo"], result["release"])
-            if "tag" in result:
-                self.__master.send_email_with_tag(result["repo"], result["tag"])
+            self.__result[repo.id] = self.__get_latest_release(repo)
 
         self.__done = True
-        self.__master.logger.info("slaver with thread %s exited", _thread.get_ident())
+        self.logger.info("slaver with thread %s exited", _thread.get_ident())
 
     def exception(self) -> Exception:
         return self.__exception
+
+    def __get_latest_release(self, repo: Repository) -> dict:
+        # by visiting releases.atom page
+        self.logger.info("start get latest release of %s", repo.full_name)
+
+        atom_url = "%s/releases.atom" % repo.html_url
+        while True:
+            try:
+                xml = ElementTree(file=self.__opener.open(atom_url, timeout=30))
+                break
+            except Exception as e:
+                logging.error("failed to visit %s: %s", atom_url, e)
+
+        latest_release = None
+        for elem in xml.iter("{http://www.w3.org/2005/Atom}entry"):
+            release = {
+                "repo_name": repo.full_name,
+                "repo_url": repo.html_url,
+                "release_name": elem.find("{http://www.w3.org/2005/Atom}id").text.split("/")[-1],
+                "release_time": parser().parse(elem.find("{http://www.w3.org/2005/Atom}updated").text).replace(tzinfo=local_timezone),
+                "release_url": elem.find("{http://www.w3.org/2005/Atom}link").attrib["href"],
+                "release_title": elem.find("{http://www.w3.org/2005/Atom}title").text,
+                "release_content": elem.find("{http://www.w3.org/2005/Atom}content").text,
+            }
+            if latest_release is not None:
+                if latest_release["release_time"] < release["release_time"]:
+                    latest_release = release
+            else:
+                latest_release = release
+
+        if latest_release is None:
+            self.logger.info("%s has no release", repo.full_name)
+            return None
+
+        self.logger.info("%s's latest release: %s, %s, %s",
+                         repo.full_name,
+                         latest_release["release_name"], latest_release["release_title"],
+                         latest_release["release_time"].isoformat())
+        return latest_release
